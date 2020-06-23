@@ -152,7 +152,7 @@ class BOW(D.Layer):
     def __init__(self):
         super().__init__()
         self.emb = D.Embedding([len(student_vocab), 128], padding_idx=0)
-        self.fc = D.Linear(128, 2)
+        self.fc = D.Linear(128, 2, act='relu')
     def forward(self, ids, labels=None):
         embbed = self.emb(ids)
         pad_mask = L.unsqueeze(L.cast(ids!=0, 'float32'), [-1])
@@ -164,7 +164,7 @@ class BOW(D.Layer):
             if len(labels.shape)==1:
                 labels = L.reshape(labels, [-1, 1])
             loss = L.softmax_with_cross_entropy(logits, labels)
-            loss = L.reduce_mean(loss)
+            #loss = L.reduce_mean(loss)
         else:
             loss = None
         return loss, logits
@@ -193,7 +193,7 @@ class CNN(D.Layer):
             if len(labels.shape)==1:
                 labels = L.reshape(labels, [-1, 1])
             loss = L.softmax_with_cross_entropy(logits, labels)
-            loss = L.reduce_mean(loss)
+            #loss = L.reduce_mean(loss)
         else:
             loss = None
         return loss, logits
@@ -201,22 +201,31 @@ class CNN(D.Layer):
 def KL(pred, target):
     pred = L.log(L.softmax(pred))
     target = L.softmax(target)
-    loss = L.kldiv_loss(pred, target)
+    loss = L.kldiv_loss(pred, target, reduction='none')
+    return loss
+
+def KL_T(logits_s, logits_t, T=2.0):
+    p = L.softmax(logits_t / T)
+    loss = L.softmax_with_cross_entropy(
+        logits_s / T, p, soft_label=True)
+
     return loss
     
 teacher_model.eval()
 model = BOW()
-g_clip = F.clip.GradientClipByGlobalNorm(1.0) #experimental
-opt = AdamW(learning_rate=LR, parameter_list=model.parameters(), weight_decay=0.01, grad_clip=g_clip)
+#g_clip = F.clip.GradientClipByGlobalNorm(1.0) #experimental
+#opt = AdamW(learning_rate=LR, parameter_list=model.parameters(), weight_decay=0.01, grad_clip=g_clip)
+opt = AdamW(learning_rate=LR, parameter_list=model.parameters(), weight_decay=0.01)
 model.train()
 for epoch in range(EPOCH):
-    for step, (ids_student, ids, sids, label) in enumerate(train_ds.start(place)):
+    for step, (ids_student, ids, sids, label) in enumerate(train_ds_unlabel.start(place)):
         _, logits_t = teacher_model(ids, sids) # teacher 模型输出logits
         logits_t.stop_gradient=True
         _, logits_s = model(ids_student) # student 模型输出logits
         loss_ce, _ = model(ids_student, labels=label)
-        loss_kd = KL(logits_s, logits_t)    # 由KL divergence度量两个分布的距离
+        loss_kd = KL_T(logits_s, logits_t)    # 由KL divergence度量两个分布的距离
         loss = loss_ce + loss_kd
+        loss=L.reduce_mean(loss)
         loss.backward()
         if step % 10 == 0:
             print('[step %03d] distill train loss %.5f lr %.3e' % (step, loss.numpy(), opt.current_step_lr()))
@@ -226,7 +235,7 @@ for epoch in range(EPOCH):
     print('student f1 %.5f' % f1)
 
 # 最后再加一轮hard label训练巩固结果
-for step, (ids_student, ids, sids, label) in enumerate(train_ds.start(place)):
+for step, (ids_student, ids, sids, label) in enumerate(train_ds_unlabel.start(place)):
     loss, _ = model(ids_student, labels=label)
     loss.backward()
     if step % 10 == 0:
