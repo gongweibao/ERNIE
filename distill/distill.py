@@ -76,6 +76,11 @@ dev_ds = feature_column.build_dataset('dev', data_dir=os.path.join(DATA_DIR, 'de
     .map(map_fn) \
     .padded_batch(BATCH,) 
 
+test_ds = feature_column.build_dataset('test', data_dir=os.path.join(DATA_DIR, 'test/'), shuffle=False, repeat=False, use_gz=False) \
+    .map(map_fn) \
+    .padded_batch(BATCH,) 
+
+
 shapes = ([-1,SEQLEN],[-1,SEQLEN], [-1, SEQLEN], [-1])
 types = ('int64', 'int64', 'int64', 'int64')
 
@@ -85,6 +90,8 @@ train_ds_unlabel.data_shapes = shapes
 train_ds_unlabel.data_types = types
 dev_ds.data_shapes = shapes
 dev_ds.data_types = types
+test_ds.data_shapes = shapes
+test_ds.data_types = types
 
 place = F.CUDAPlace(0)
 D.guard(place).__enter__()
@@ -152,7 +159,7 @@ class BOW(D.Layer):
     def __init__(self):
         super().__init__()
         self.emb = D.Embedding([len(student_vocab), 128], padding_idx=0)
-        self.fc = D.Linear(128, 2, act='relu')
+        self.fc = D.Linear(128, 2)
     def forward(self, ids, labels=None):
         embbed = self.emb(ids)
         pad_mask = L.unsqueeze(L.cast(ids!=0, 'float32'), [-1])
@@ -215,7 +222,11 @@ teacher_model.eval()
 model = BOW()
 #g_clip = F.clip.GradientClipByGlobalNorm(1.0) #experimental
 #opt = AdamW(learning_rate=LR, parameter_list=model.parameters(), weight_decay=0.01, grad_clip=g_clip)
-opt = AdamW(learning_rate=LR, parameter_list=model.parameters(), weight_decay=0.01)
+boundaries = [1190*2, 1190*4, 1190*6]
+#values = [4e-4, 2.5e-4, 2e-4]
+values = [1e-4, 1.5e-4, 2.5e-4, 4e-4]
+lr_decay=D.PiecewiseDecay(boundaries, values, 0)
+opt = AdamW(learning_rate=lr_decay, parameter_list=model.parameters(), weight_decay=0.01)
 model.train()
 for epoch in range(EPOCH):
     for step, (ids_student, ids, sids, label) in enumerate(train_ds_unlabel.start(place)):
@@ -232,11 +243,14 @@ for epoch in range(EPOCH):
         opt.minimize(loss)
         model.clear_gradients()
     f1 = evaluate_student(model, dev_ds)
-    print('student f1 %.5f' % f1)
+    print('student  on dev f1 %.5f' % f1)
+    f1 = evaluate_student(model, test_ds)
+    print('student  on test f1 %.5f' % f1)
 
 # 最后再加一轮hard label训练巩固结果
 for step, (ids_student, ids, sids, label) in enumerate(train_ds_unlabel.start(place)):
     loss, _ = model(ids_student, labels=label)
+    loss = L.reduce_mean(loss)
     loss.backward()
     if step % 10 == 0:
         print('[step %03d] train loss %.5f lr %.3e' % (step, loss.numpy(), opt.current_step_lr()))
